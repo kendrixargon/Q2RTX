@@ -430,8 +430,6 @@ bool Add_Ammo(edict_t *ent, const gitem_t *item, int count)
     if (rebalance->value == 1) {
         if (item->tag == AMMO_ROCKETS || item->tag == AMMO_GRENADES)
             count = (count + 1) / 2;
-        else if (item->tag == AMMO_BULLETS || item->tag == AMMO_CELLS)
-            count = 30;
         else 
             count = count / 2;
     }
