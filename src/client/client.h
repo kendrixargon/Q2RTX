@@ -104,6 +104,7 @@ typedef struct centity_s {
     centity_state_t     prev;           // will always be valid, but might just be a copy of current
 
     vec3_t          mins, maxs;
+    float           radius;             // from mid point
 
     int             serverframe;        // if not current, this ent isn't in the frame
 
@@ -328,6 +329,8 @@ typedef struct client_state_s {
 
     char    weaponModels[MAX_CLIENTWEAPONMODELS][MAX_QPATH];
     int     numWeaponModels;
+
+    bool    need_powerscreen_scale;
 } client_state_t;
 
 extern client_state_t   cl;
@@ -829,6 +832,8 @@ typedef struct cl_sustain_s {
 } cl_sustain_t;
 
 void CL_SmokeAndFlash(const vec3_t origin);
+void CL_DrawBeam(const vec3_t org, const vec3_t end, qhandle_t model);
+void CL_PlayFootstepSfx(int step_id, int entnum, float volume, float attenuation);
 
 void CL_RegisterTEntSounds(void);
 void CL_RegisterTEntModels(void);
@@ -871,6 +876,7 @@ typedef struct cparticle_s {
 
 typedef struct cdlight_s {
     int     key;        // so entities can reuse same entry
+    int     born;       // cl.time when this light was created
     vec3_t  color;
     vec3_t  origin;
     float   radius;
@@ -879,9 +885,18 @@ typedef struct cdlight_s {
 	vec3_t  velosity;     // move this far each second
 } cdlight_t;
 
+typedef enum {
+    DT_GIB,
+    DT_GREENGIB,
+    DT_SMOKE,
+    DT_FIREBALL,
+
+    DT_COUNT
+} diminishing_trail_t;
+
 void CL_BigTeleportParticles(const vec3_t org);
 void CL_RocketTrail(const vec3_t start, const vec3_t end, centity_t *old);
-void CL_DiminishingTrail(const vec3_t start, const vec3_t end, centity_t *old, int flags);
+void CL_DiminishingTrail(const vec3_t start, const vec3_t end, centity_t *old, diminishing_trail_t type);
 void CL_FlyEffect(centity_t *ent, const vec3_t origin);
 void CL_BfgParticles(entity_t *ent);
 void CL_ItemRespawnParticles(const vec3_t org);
@@ -925,7 +940,7 @@ void CL_ParticleSteamEffect(const vec3_t org, const vec3_t dir, int color, int c
 void CL_TrackerTrail(const vec3_t start, const vec3_t end, int particleColor);
 void CL_TagTrail(const vec3_t start, const vec3_t end, int color);
 void CL_ColorFlash(const vec3_t pos, int ent, int intensity, float r, float g, float b);
-void CL_Tracker_Shell(const vec3_t origin);
+void CL_Tracker_Shell(const centity_t *cent, const vec3_t origin);
 void CL_MonsterPlasma_Shell(const vec3_t origin);
 void CL_ColorExplosionParticles(const vec3_t org, int color, int run);
 void CL_ParticleSmokeEffect(const vec3_t org, const vec3_t dir, int color, int count, int magnitude);
@@ -936,6 +951,8 @@ void CL_IonripperTrail(const vec3_t start, const vec3_t end);
 void CL_TrapParticles(centity_t *ent, const vec3_t origin);
 void CL_ParticleEffect3(const vec3_t org, const vec3_t dir, int color, int count);
 void CL_ParticleSteamEffect2(cl_sustain_t *self);
+void CL_BerserkSlamParticles(const vec3_t org, const vec3_t dir);
+void CL_PowerSplash(void);
 void CL_TeleporterParticles2(const vec3_t org);
 void CL_HologramParticles(const vec3_t org);
 void CL_BarrelExplodingParticles(const vec3_t org);

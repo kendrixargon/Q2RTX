@@ -337,21 +337,19 @@ LOAD(Edges)
 LOAD(SurfEdges)
 {
     msurfedge_t *out;
-    int         i, vert;
-    int32_t     index;
+    int         i;
+    uint32_t    index, vert;
 
     bsp->numsurfedges = count;
     bsp->surfedges = ALLOC(sizeof(*out) * count);
 
     out = bsp->surfedges;
     for (i = 0; i < count; i++, out++) {
-        index = (int32_t)BSP_Long();
+        index = BSP_Long();
 
-        vert = 0;
-        if (index < 0) {
+        vert = index >> 31;
+        if (vert)
             index = -index;
-            vert = 1;
-        }
 
         if (index >= bsp->numedges) {
             DEBUG("bad edgenum");
@@ -629,6 +627,10 @@ LOAD(SubModels)
         DEBUG("map with no models");
         return Q_ERR_INVALID_FORMAT;
     }
+    if (count > MAX_MODELS - 2) {
+        DEBUG("too many models");
+        return Q_ERR_INVALID_FORMAT;
+    }
 
     bsp->nummodels = count;
     bsp->models = ALLOC(sizeof(*out) * count);
@@ -764,6 +766,11 @@ typedef struct {
     uint32_t memsize;
 } lump_info_t;
 
+typedef struct {
+    int ofs;
+    const char *name;
+} bsp_stat_t;
+
 #define L(name, lump, mem_t, disksize1, disksize2) \
     { BSP_Load##name, #name, lump, { disksize1, disksize2 }, sizeof(mem_t) }
 
@@ -792,12 +799,70 @@ static const lump_info_t bsp_lumps[] = {
 
 #undef L
 
+#define F(x) { q_offsetof(bsp_t, num##x), #x }
+
+static const bsp_stat_t bsp_stats[] = {
+    F(brushsides),
+    F(texinfo),
+    F(planes),
+    F(nodes),
+    F(leafs),
+    F(leafbrushes),
+    F(models),
+    F(brushes),
+    F(visibility),
+    F(entitychars),
+    F(areas),
+    F(areaportals),
+#if USE_REF
+    F(faces),
+    F(leaffaces),
+    F(lightmapbytes),
+    F(vertices),
+    F(edges),
+    F(surfedges),
+#endif
+};
+
+#undef F
+
 static list_t   bsp_cache;
+
+static void BSP_PrintStats(bsp_t *bsp)
+{
+    bool extended = bsp->extended;
+
+    for (int i = 0; i < q_countof(bsp_stats); i++) {
+        const bsp_stat_t *s = &bsp_stats[i];
+        Com_Printf("%8d : %s\n", *(int *)((byte *)bsp + s->ofs), s->name);
+    }
+    if (bsp->vis)
+        Com_Printf("%8u : clusters\n", bsp->vis->numclusters);
+
+#if USE_REF
+    extended |= bsp->lm_decoupled;
+#endif
+
+    if (extended) {
+        Com_Printf("Features :");
+        if (bsp->extended)
+            Com_Printf(" QBSP");
+#if USE_REF
+        if (bsp->lm_decoupled)
+            Com_Printf(" DECOUPLED_LM");
+#endif
+        Com_Printf("\n");
+    }
+    Com_Printf("Checksum : %#x\n", bsp->checksum);
+
+    Com_Printf("------------------\n");
+}
 
 static void BSP_List_f(void)
 {
     bsp_t *bsp;
     size_t bytes;
+    bool verbose = Cmd_Argc() > 1;
 
     if (LIST_EMPTY(&bsp_cache)) {
         Com_Printf("BSP cache is empty\n");
@@ -810,6 +875,8 @@ static void BSP_List_f(void)
     LIST_FOR_EACH(bsp_t, bsp, &bsp_cache, entry) {
         Com_Printf("%8zu : %s (%d refs)\n",
                    bsp->hunk.mapped, bsp->name, bsp->refcount);
+        if (verbose)
+            BSP_PrintStats(bsp);
         bytes += bsp->hunk.mapped;
     }
     Com_Printf("Total resident: %zu\n", bytes);
@@ -1073,6 +1140,71 @@ bool BSP_SavePatchedPVS(bsp_t *bsp)
 	else
 		return false;
 }
+
+#if USE_CLIENT
+
+int BSP_LoadMaterials(bsp_t *bsp)
+{
+    char path[MAX_QPATH];
+    mtexinfo_t *out, *tex;
+    int i, j, step_id = FOOTSTEP_RESERVED_COUNT;
+    qhandle_t f;
+
+    for (i = 0, out = bsp->texinfo; i < bsp->numtexinfo; i++, out++) {
+        // see if already loaded material for this texinfo
+        for (j = i - 1; j >= 0; j--) {
+            tex = &bsp->texinfo[j];
+            if (!Q_stricmp(tex->name, out->name)) {
+                strcpy(out->step_material, tex->step_material);
+                out->step_id = tex->step_id;
+                break;
+            }
+        }
+        if (j != -1)
+            continue;
+
+        // load material file
+        Q_concat(path, sizeof(path), "textures/", out->name, ".mat");
+        FS_OpenFile(path, &f, FS_MODE_READ | FS_FLAG_LOADFILE);
+        if (f) {
+            FS_Read(out->material, sizeof(out->material) - 1, f);
+            FS_CloseFile(f);
+        }
+
+        if (out->step_material[0] && !COM_IsPath(out->step_material)) {
+            Com_WPrintf("Bad material \"%s\" in %s\n", Com_MakePrintable(out->step_material), path);
+            out->step_material[0] = 0;
+        }
+
+        if (!out->step_material[0] || !Q_stricmp(out->step_material, "default")) {
+            out->step_id = FOOTSTEP_ID_DEFAULT;
+            continue;
+        }
+
+        if (!Q_stricmp(out->step_material, "ladder")) {
+            out->step_id = FOOTSTEP_ID_LADDER;
+            continue;
+        }
+
+        // see if already allocated step_id for this material
+        for (j = i - 1; j >= 0; j--) {
+            tex = &bsp->texinfo[j];
+            if (!Q_stricmp(tex->step_material, out->step_material)) {
+                out->step_id = tex->step_id;
+                break;
+            }
+        }
+
+        // allocate new step_id
+        if (j == -1)
+            out->step_id = step_id++;
+    }
+
+    Com_DPrintf("%s: %d materials loaded\n", __func__, step_id);
+    return step_id;
+}
+
+#endif
 
 #if USE_REF
 static void BSP_LoadBspxNormals(bsp_t* bsp, const byte* in, size_t data_size)
@@ -1593,6 +1725,11 @@ overrun:
                 Q_SetBit(mask, 939);
                 Q_SetBit(mask, 947);
             }
+        } else if (bsp->checksum == 0x1ebe8001) {
+            // mgu6m2, waterfall
+            Q_SetBit(mask, 213);
+            Q_SetBit(mask, 214);
+            Q_SetBit(mask, 217);
         }
     }
 

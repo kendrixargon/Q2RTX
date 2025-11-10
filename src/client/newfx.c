@@ -343,11 +343,21 @@ void CL_TrackerTrail(const vec3_t start, const vec3_t end, int particleColor)
     }
 }
 
-void CL_Tracker_Shell(const vec3_t origin)
+void CL_Tracker_Shell(const centity_t *ent, const vec3_t origin)
 {
-    vec3_t          dir;
+    vec3_t          org, dir, mid;
     int             i;
     cparticle_t     *p;
+    float           radius;
+
+    if (cl.csr.extended) {
+        VectorAvg(ent->mins, ent->maxs, mid);
+        VectorAdd(origin, mid, org);
+        radius = ent->radius;
+    } else {
+        VectorCopy(origin, org);
+        radius = 40.0f;
+    }
 
     for (i = 0; i < 300; i++) {
         p = CL_AllocParticle();
@@ -366,7 +376,7 @@ void CL_Tracker_Shell(const vec3_t origin)
         dir[2] = crand();
         VectorNormalize(dir);
 
-        VectorMA(origin, 40, dir, p->org);
+        VectorMA(org, radius, dir, p->org);
     }
 }
 
@@ -862,6 +872,92 @@ void CL_ParticleEffect3(const vec3_t org, const vec3_t dir, int color, int count
 
         p->accel[0] = p->accel[1] = 0;
         p->accel[2] = PARTICLE_GRAVITY;
+        p->alpha = 1.0f;
+
+        p->alphavel = -1.0f / (0.5f + frand() * 0.3f);
+    }
+}
+
+/*
+===============
+CL_BerserkSlamParticles
+===============
+*/
+void CL_BerserkSlamParticles(const vec3_t org, const vec3_t dir)
+{
+    static const byte   colortable[4] = {110, 112, 114, 116};
+    int         i;
+    cparticle_t *p;
+    float       d;
+    vec3_t      r, u;
+
+    MakeNormalVectors(dir, r, u);
+
+    for (i = 0; i < 700; i++) {
+        p = CL_AllocParticle();
+        if (!p)
+            return;
+
+        p->time = cl.time;
+        p->color = colortable[Q_rand() & 3];
+
+        VectorCopy(org, p->org);
+
+        d = frand() * 192;
+        VectorScale(dir, d, p->vel);
+        d = crand() * 192;
+        VectorMA(p->vel, d, r, p->vel);
+        d = crand() * 192;
+        VectorMA(p->vel, d, u, p->vel);
+
+        VectorClear(p->accel);
+        p->alpha = 1.0f;
+
+        p->alphavel = -1.0f / (0.5f + frand() * 0.3f);
+    }
+}
+
+/*
+===============
+CL_PowerSplash
+
+TODO: differentiate screen/shield
+===============
+*/
+void CL_PowerSplash(void)
+{
+    static const byte   colortable[4] = {208, 209, 210, 211};
+    int         i;
+    cparticle_t *p;
+    vec3_t      org, dir, mid;
+    centity_t   *ent;
+
+    if ((unsigned)te.entity1 >= cl.csr.max_edicts)
+        Com_Error(ERR_DROP, "%s: bad entity", __func__);
+
+    ent = &cl_entities[te.entity1];
+    if (ent->serverframe != cl.frame.number)
+        return;
+
+    VectorAvg(ent->mins, ent->maxs, mid);
+    VectorAdd(ent->current.origin, mid, org);
+
+    for (i = 0; i < 256; i++) {
+        p = CL_AllocParticle();
+        if (!p)
+            return;
+
+        p->time = cl.time;
+        p->color = colortable[Q_rand() & 3];
+
+        dir[0] = crand();
+        dir[1] = crand();
+        dir[2] = crand();
+        VectorNormalize(dir);
+        VectorMA(org, ent->radius, dir, p->org);
+        VectorScale(dir, 40.0f, p->vel);
+
+        VectorClear(p->accel);
         p->alpha = 1.0f;
 
         p->alphavel = -1.0f / (0.5f + frand() * 0.3f);

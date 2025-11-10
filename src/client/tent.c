@@ -19,6 +19,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 // cl_tent.c -- client side temporary entities
 
 #include "client.h"
+#include "common/mdfour.h"
 #include "refresh/models.h"
 
 qhandle_t   cl_sfx_ric1;
@@ -33,7 +34,6 @@ qhandle_t   cl_sfx_railg;
 qhandle_t   cl_sfx_rockexp;
 qhandle_t   cl_sfx_grenexp;
 qhandle_t   cl_sfx_watrexp;
-qhandle_t   cl_sfx_footsteps[4];
 
 qhandle_t   cl_sfx_lightning;
 qhandle_t   cl_sfx_disrexp;
@@ -56,6 +56,186 @@ qhandle_t   cl_mod_explo4_big;
 
 extern cvar_t* cvar_pt_particle_emissive;
 
+#define MAX_FOOTSTEP_SFX    9
+
+typedef struct {
+    int         num_sfx;
+    qhandle_t   sfx[MAX_FOOTSTEP_SFX];
+} cl_footstep_sfx_t;
+
+static cl_footstep_sfx_t    *cl_footstep_sfx;
+static int                  cl_num_footsteps;
+static qhandle_t            cl_last_footstep;
+
+extern mtexinfo_t nulltexinfo;
+
+/*
+=================
+CL_FindFootstepSurface
+=================
+*/
+static int CL_FindFootstepSurface(int entnum)
+{
+    int footstep_id = FOOTSTEP_ID_DEFAULT;
+    centity_t *cent = &cl_entities[entnum];
+
+    // skip if no materials loaded
+    if (cl_num_footsteps <= FOOTSTEP_RESERVED_COUNT)
+        return footstep_id;
+
+    // allow custom footsteps to be disabled
+    if (cl_footsteps->integer >= 2)
+        return footstep_id;
+
+    // use an X/Y only mins/maxs copy of the entity,
+    // since we don't want it to get caught inside of any geometry above or below
+    const vec3_t trace_mins = { cent->mins[0], cent->mins[1], 0 };
+    const vec3_t trace_maxs = { cent->maxs[0], cent->maxs[1], 0 };
+
+    // trace start position is the entity's current origin + { 0 0 1 },
+    // so that entities with their mins at 0 won't get caught in the floor
+    vec3_t trace_start;
+    VectorCopy(cent->current.origin, trace_start);
+    trace_start[2] += 1;
+
+    // the end of the trace starts down by half of STEPSIZE
+    vec3_t trace_end;
+    VectorCopy(trace_start, trace_end);
+    trace_end[2] -= 9;
+    if (cent->current.solid && cent->current.solid != PACKED_BSP) {
+        // if the entity is a bbox'd entity, the mins.z is added to the end point as well
+        trace_end[2] += cent->mins[2];
+    } else {
+        // otherwise use a value that should cover every monster in the game
+        trace_end[2] -= 66; // should you wonder: monster_guardian is the biggest boi
+    }
+
+    // first, a trace done solely against MASK_SOLID
+    trace_t tr;
+    CL_Trace(&tr, trace_start, trace_mins, trace_maxs, trace_end, MASK_SOLID);
+
+    if (tr.fraction == 1.0f) {
+        // if we didn't hit anything, use default step ID
+        return footstep_id;
+    }
+
+    if (tr.surface != &(nulltexinfo.c)) {
+        // copy over the surfaces' step ID
+        footstep_id = ((mtexinfo_t *)tr.surface)->step_id;
+
+        // do another trace that ends instead at endpos + { 0 0 1 }, and is against MASK_SOLID | MASK_WATER
+        vec3_t new_end;
+        VectorCopy(tr.endpos, new_end);
+        new_end[2] += 1;
+
+        CL_Trace(&tr, trace_start, trace_mins, trace_maxs, new_end, MASK_SOLID | MASK_WATER);
+        // if we hit something else, use that new footstep id instead of the first traces' value
+        if (tr.surface != &(nulltexinfo.c))
+            footstep_id = ((mtexinfo_t *)tr.surface)->step_id;
+    }
+
+    return footstep_id;
+}
+
+/*
+=================
+CL_PlayFootstepSfx
+=================
+*/
+void CL_PlayFootstepSfx(int step_id, int entnum, float volume, float attenuation)
+{
+    const cl_footstep_sfx_t *sfx;
+    qhandle_t footstep_sfx;
+    int sfx_num;
+
+    if (!cl_num_footsteps)
+        return; // should not really happen
+
+    if (step_id == -1)
+        step_id = CL_FindFootstepSurface(entnum);
+
+    Q_assert((unsigned)step_id < cl_num_footsteps);
+
+    sfx = &cl_footstep_sfx[step_id];
+    if (!sfx->num_sfx)
+        sfx = &cl_footstep_sfx[0];
+    if (!sfx->num_sfx)
+        return; // no footsteps, not even fallbacks
+
+    // pick a random footstep sound, but avoid playing the same one twice in a row
+    sfx_num = Q_rand_uniform(sfx->num_sfx);
+    footstep_sfx = sfx->sfx[sfx_num];
+    if (footstep_sfx == cl_last_footstep)
+        footstep_sfx = sfx->sfx[(sfx_num + 1) % sfx->num_sfx];
+
+    S_StartSound(NULL, entnum, CHAN_BODY, footstep_sfx, volume, attenuation, 0);
+    cl_last_footstep = footstep_sfx;
+}
+
+/*
+=================
+CL_RegisterFootstep
+=================
+*/
+static void CL_RegisterFootstep(cl_footstep_sfx_t *sfx, const char *material)
+{
+    char name[MAX_QPATH];
+    size_t len;
+    int i;
+
+    Q_assert(!material || *material);
+
+    for (i = 0; i < MAX_FOOTSTEP_SFX; i++) {
+        if (material)
+            len = Q_snprintf(name, sizeof(name), "#sound/player/steps/%s%i.wav", material, i + 1);
+        else
+            len = Q_snprintf(name, sizeof(name), "#sound/player/step%i.wav", i + 1);
+        Q_assert(len < sizeof(name));
+        if (FS_LoadFile(name + 1, NULL) < 0)
+            break;
+        sfx->sfx[i] = S_RegisterSound(name);
+    }
+
+    sfx->num_sfx = i;
+}
+
+/*
+=================
+CL_RegisterFootsteps
+=================
+*/
+static void CL_RegisterFootsteps(void)
+{
+    mtexinfo_t *tex;
+    int i;
+
+    cl_last_footstep = 0;
+
+    Z_Freep((void**)&cl_footstep_sfx);
+    if (!cl.bsp) {
+        cl_num_footsteps = 0;
+        return;
+    }
+
+    cl_num_footsteps = BSP_LoadMaterials(cl.bsp);
+    Q_assert(cl_num_footsteps >= FOOTSTEP_RESERVED_COUNT);
+    cl_footstep_sfx = Z_Malloc(sizeof(cl_footstep_sfx[0]) * cl_num_footsteps);
+
+    for (i = 0; i < cl_num_footsteps; i++)
+        cl_footstep_sfx[i].num_sfx = -1;
+
+    // load reserved footsteps
+    CL_RegisterFootstep(&cl_footstep_sfx[FOOTSTEP_ID_DEFAULT], NULL);
+    CL_RegisterFootstep(&cl_footstep_sfx[FOOTSTEP_ID_LADDER], "ladder");
+
+    // load the rest
+    for (i = 0, tex = cl.bsp->texinfo; i < cl.bsp->numtexinfo; i++, tex++) {
+        cl_footstep_sfx_t *sfx = &cl_footstep_sfx[tex->step_id];
+        if (sfx->num_sfx == -1)
+            CL_RegisterFootstep(sfx, tex->step_material);
+    }
+}
+
 /*
 =================
 CL_RegisterTEntSounds
@@ -63,9 +243,6 @@ CL_RegisterTEntSounds
 */
 void CL_RegisterTEntSounds(void)
 {
-    int     i;
-    char    name[MAX_QPATH];
-
     cl_sfx_ric1 = S_RegisterSound("world/ric1.wav");
     cl_sfx_ric2 = S_RegisterSound("world/ric2.wav");
     cl_sfx_ric3 = S_RegisterSound("world/ric3.wav");
@@ -83,10 +260,7 @@ void CL_RegisterTEntSounds(void)
     S_RegisterSound("player/fall2.wav");
     S_RegisterSound("player/fall1.wav");
 
-    for (i = 0; i < 4; i++) {
-        Q_snprintf(name, sizeof(name), "player/step%i.wav", i + 1);
-        cl_sfx_footsteps[i] = S_RegisterSound(name);
-    }
+    CL_RegisterFootsteps();
 
     cl_sfx_lightning = S_RegisterSound("weapons/tesla.wav");
     cl_sfx_disrexp = S_RegisterSound("weapons/disrupthit.wav");
@@ -99,6 +273,9 @@ CL_RegisterTEntModels
 */
 void CL_RegisterTEntModels(void)
 {
+    void *data;
+    int len;
+
     cl_mod_explode = R_RegisterModel("models/objects/explode/tris.md2");
     cl_mod_smoke = R_RegisterModel("models/objects/smoke/tris.md2");
     cl_mod_flash = R_RegisterModel("models/objects/flash/tris.md2");
@@ -126,6 +303,11 @@ void CL_RegisterTEntModels(void)
     		model->sprite_vertical = true;
         }
     }
+
+    // check for remaster powerscreen model (ugly!)
+    len = FS_LoadFile("models/items/armor/effect/tris.md2", &data);
+    cl.need_powerscreen_scale = len == 2300 && Com_BlockChecksum(data, len) == 0x19fca65b;
+    FS_FreeFile(data);
 }
 
 /*
@@ -199,6 +381,23 @@ static explosion_t *CL_PlainExplosion(bool big)
 	}
 
     return ex;
+}
+
+static void CL_BFGExplosion(const vec3_t pos)
+{
+    explosion_t *ex;
+
+    ex = CL_AllocExplosion();
+    VectorCopy(pos, ex->ent.origin);
+    ex->type = ex_poly;
+    ex->ent.flags = RF_FULLBRIGHT;
+    ex->start = cl.servertime - CL_FRAMETIME;
+    ex->light = 350;
+    VectorSet(ex->lightcolor, 0.0f, 1.0f, 0.0f);
+    ex->ent.model = cl_mod_bfg_explo;
+    ex->ent.flags |= RF_TRANSLUCENT;
+    ex->ent.alpha = 0.80f;
+    ex->frames = 4;
 }
 
 /*
@@ -579,6 +778,66 @@ static void CL_ParsePlayerBeam(qhandle_t model)
     }
 }
 
+void CL_DrawBeam(const vec3_t start, const vec3_t end, qhandle_t model)
+{
+    int         i, steps;
+    vec3_t      dist, angles;
+    entity_t    ent;
+    float       d, len, model_length;
+
+    // calculate pitch and yaw
+    VectorSubtract(end, start, dist);
+    vectoangles2(dist, angles);
+
+    // add new entities for the beams
+    d = VectorNormalize(dist);
+    if (model == cl_mod_lightning) {
+        model_length = 35.0f;
+        d -= 20.0f; // correction so it doesn't end in middle of tesla
+    } else {
+        model_length = 30.0f;
+    }
+    steps = ceilf(d / model_length);
+
+    memset(&ent, 0, sizeof(ent));
+    ent.model = model;
+
+    // PMM - special case for lightning model .. if the real length is shorter than the model,
+    // flip it around & draw it from the end to the start.  This prevents the model from going
+    // through the tesla mine (instead it goes through the target)
+    if ((model == cl_mod_lightning) && (steps <= 1)) {
+        VectorCopy(end, ent.origin);
+        ent.flags = RF_FULLBRIGHT;
+        ent.angles[0] = angles[0];
+        ent.angles[1] = angles[1];
+        ent.angles[2] = Q_rand() % 360;
+        V_AddEntity(&ent);
+        return;
+    }
+
+    if (steps > 1) {
+        len = (d - model_length) / (steps - 1);
+        VectorScale(dist, len, dist);
+    }
+
+    VectorCopy(start, ent.origin);
+    for (i = 0; i < steps; i++) {
+        if (model == cl_mod_lightning) {
+            ent.flags = RF_FULLBRIGHT;
+            ent.angles[0] = -angles[0];
+            ent.angles[1] = angles[1] + 180.0f;
+            ent.angles[2] = Q_rand() % 360;
+        } else {
+            ent.angles[0] = angles[0];
+            ent.angles[1] = angles[1];
+            ent.angles[2] = Q_rand() % 360;
+        }
+
+        V_AddEntity(&ent);
+        VectorAdd(ent.origin, dist, ent.origin);
+    }
+}
+
 /*
 =================
 CL_AddBeams
@@ -586,14 +845,9 @@ CL_AddBeams
 */
 static void CL_AddBeams(void)
 {
-    int         i, j, steps;
+    int         i;
     beam_t      *b;
-    vec3_t      dist, org;
-    float       d;
-    entity_t    ent;
-    vec3_t      angles;
-    float       len;
-    float       model_length;
+    vec3_t      org;
 
 // update beams
     for (i = 0, b = cl_beams; i < MAX_BEAMS; i++, b++) {
@@ -606,57 +860,7 @@ static void CL_AddBeams(void)
         else
             VectorAdd(b->start, b->offset, org);
 
-        // calculate pitch and yaw
-        VectorSubtract(b->end, org, dist);
-        vectoangles2(dist, angles);
-
-        // add new entities for the beams
-        d = VectorNormalize(dist);
-        if (b->model == cl_mod_lightning) {
-            model_length = 35.0f;
-            d -= 20.0f; // correction so it doesn't end in middle of tesla
-        } else {
-            model_length = 30.0f;
-        }
-        steps = ceilf(d / model_length);
-
-        memset(&ent, 0, sizeof(ent));
-        ent.model = b->model;
-
-        // PMM - special case for lightning model .. if the real length is shorter than the model,
-        // flip it around & draw it from the end to the start.  This prevents the model from going
-        // through the tesla mine (instead it goes through the target)
-        if ((b->model == cl_mod_lightning) && (steps <= 1)) {
-            VectorCopy(b->end, ent.origin);
-            ent.flags = RF_FULLBRIGHT;
-            ent.angles[0] = angles[0];
-            ent.angles[1] = angles[1];
-            ent.angles[2] = Q_rand() % 360;
-            V_AddEntity(&ent);
-            return;
-        }
-
-        if (steps > 1) {
-            len = (d - model_length) / (steps - 1);
-            VectorScale(dist, len, dist);
-        }
-
-        VectorCopy(org, ent.origin);
-        for (j = 0; j < steps; j++) {
-            if (b->model == cl_mod_lightning) {
-                ent.flags = RF_FULLBRIGHT;
-                ent.angles[0] = -angles[0];
-                ent.angles[1] = angles[1] + 180.0f;
-                ent.angles[2] = Q_rand() % 360;
-            } else {
-                ent.angles[0] = angles[0];
-                ent.angles[1] = angles[1];
-                ent.angles[2] = Q_rand() % 360;
-            }
-
-            V_AddEntity(&ent);
-            VectorAdd(ent.origin, dist, ent.origin);
-        }
+        CL_DrawBeam(org, b->end, b->model);
     }
 }
 
@@ -664,7 +868,7 @@ static void CL_AddBeams(void)
 =================
 CL_AddPlayerBeams
 
-Draw player locked beams. Currently only used by the plasma beam.
+Draw player locked beams.
 =================
 */
 static void CL_AddPlayerBeams(void)
@@ -712,20 +916,23 @@ static void CL_AddPlayerBeams(void)
             // calculate pitch and yaw
             VectorSubtract(b->end, org, dist);
 
-            // FIXME: don't add offset twice?
-            d = VectorLength(dist);
-            VectorScale(cl.v_forward, d, dist);
-            VectorMA(dist, (hand_multiplier * b->offset[0]), cl.v_right, dist);
-            VectorMA(dist, b->offset[1], cl.v_forward, dist);
-            VectorMA(dist, b->offset[2], cl.v_up, dist);
-            if (info_hand->integer == 2)
-                VectorMA(org, -1, cl.v_up, org);
+            if (b->model != cl_mod_grapple_cable) {
+                // FIXME: don't add offset twice?
+                d = VectorLength(dist);
+                VectorScale(cl.v_forward, d, dist);
+                VectorMA(dist, (hand_multiplier * b->offset[0]), cl.v_right, dist);
+                VectorMA(dist, b->offset[1], cl.v_forward, dist);
+                VectorMA(dist, b->offset[2], cl.v_up, dist);
+                if (info_hand->integer == 2)
+                    VectorMA(dist, -1, cl.v_up, dist);
+            }
 
             // FIXME: use cl.refdef.viewangles?
             vectoangles2(dist, angles);
 
             // if it's the heatbeam, draw the particle effect
-            CL_Heatbeam(org, dist);
+            if (cl_mod_heatbeam && b->model == cl_mod_heatbeam)
+                CL_Heatbeam(org, dist);
 
             framenum = 1;
         } else {
@@ -747,7 +954,7 @@ static void CL_AddPlayerBeams(void)
                 VectorMA(org, -b->offset[0] + 1, r, org);
                 VectorMA(org, -b->offset[1], f, org);
                 VectorMA(org, -b->offset[2] - 10, u, org);
-            } else {
+            } else if (cl_mod_heatbeam && b->model == cl_mod_heatbeam) {
                 // if it's a monster, do the particle effect
                 CL_MonsterPlasma_Shell(b->start);
             }
@@ -757,23 +964,63 @@ static void CL_AddPlayerBeams(void)
 
         // add new entities for the beams
         d = VectorNormalize(dist);
-        model_length = 32.0f;
+        if (b->model == cl_mod_heatbeam) {
+            model_length = 32.0f;
+        } else if (b->model == cl_mod_lightning) {
+            model_length = 35.0f;
+            d -= 20.0f; // correction so it doesn't end in middle of tesla
+        } else {
+            model_length = 30.0f;
+        }
+
+        // correction for grapple cable model, which has origin in the middle
+        if (b->entity == cl.frame.clientNum + 1 && b->model == cl_mod_grapple_cable && hand_multiplier) {
+            VectorMA(org, model_length * 0.5f, dist, org);
+            d -= model_length * 0.5f;
+        }
+
         steps = ceilf(d / model_length);
+
+        memset(&ent, 0, sizeof(ent));
+        ent.model = b->model;
+
+        // PMM - special case for lightning model .. if the real length is shorter than the model,
+        // flip it around & draw it from the end to the start.  This prevents the model from going
+        // through the tesla mine (instead it goes through the target)
+        if ((b->model == cl_mod_lightning) && (steps <= 1)) {
+            VectorCopy(b->end, ent.origin);
+            ent.flags = RF_FULLBRIGHT;
+            ent.angles[0] = angles[0];
+            ent.angles[1] = angles[1];
+            ent.angles[2] = Q_rand() % 360;
+            V_AddEntity(&ent);
+            continue;
+        }
+
         if (steps > 1) {
             len = (d - model_length) / (steps - 1);
             VectorScale(dist, len, dist);
         }
 
-        memset(&ent, 0, sizeof(ent));
-        ent.model = b->model;
-        ent.frame = framenum;
-        ent.flags = RF_FULLBRIGHT;
-        ent.angles[0] = -angles[0];
-        ent.angles[1] = angles[1] + 180.0f;
-        ent.angles[2] = cl.time % 360;
-
         VectorCopy(org, ent.origin);
         for (j = 0; j < steps; j++) {
+            if (b->model == cl_mod_heatbeam) {
+                ent.frame = framenum;
+                ent.flags = RF_FULLBRIGHT;
+                ent.angles[0] = -angles[0];
+                ent.angles[1] = angles[1] + 180.0f;
+                ent.angles[2] = cl.time % 360;
+            } else if (b->model == cl_mod_lightning) {
+                ent.flags = RF_FULLBRIGHT;
+                ent.angles[0] = -angles[0];
+                ent.angles[1] = angles[1] + 180.0f;
+                ent.angles[2] = Q_rand() % 360;
+            } else {
+                ent.angles[0] = angles[0];
+                ent.angles[1] = angles[1];
+                ent.angles[2] = Q_rand() % 360;
+            }
+
             V_AddEntity(&ent);
             VectorAdd(ent.origin, dist, ent.origin);
         }
@@ -1014,7 +1261,7 @@ static void CL_RailTrail(void)
 {
 	color_t rail_color;
 	
-	if (!cl_railtrail_type->integer) 
+	if (!cl_railtrail_type->integer && te.type != TE_RAILTRAIL2) 
 	{
 		rail_color.u32 = d_8to24table[0x74];
 
@@ -1032,7 +1279,7 @@ static void CL_RailTrail(void)
         }
     }
 
-    if (!cl_railtrail_type->integer || cvar_pt_beam_lights->value <= 0)
+    if (!cl_railtrail_type->integer || (cls.ref_type == REF_TYPE_VKPT && cvar_pt_beam_lights->value <= 0))
     {
         CL_RailLights(rail_color);
     }
@@ -1131,7 +1378,11 @@ void CL_ParseTEnt(void)
         CL_ParticleEffect2(te.pos1, te.dir, te.color, te.count);
         break;
 
-    case TE_BLUEHYPERBLASTER:
+    case TE_BLUEHYPERBLASTER:   // broken version
+        CL_BlasterParticles(te.pos1, te.pos2);
+        break;
+
+    case TE_BLUEHYPERBLASTER_2: // fixed version
         CL_BlasterParticles(te.pos1, te.dir);
         break;
 
@@ -1186,6 +1437,7 @@ void CL_ParseTEnt(void)
         break;
 
     case TE_RAILTRAIL:          // railgun effect
+    case TE_RAILTRAIL2:
         CL_RailTrail();
         S_StartSound(te.pos2, 0, 0, cl_sfx_railg, 1, ATTN_NORM, 0);
         break;
@@ -1214,12 +1466,15 @@ void CL_ParseTEnt(void)
         break;
 
     case TE_EXPLOSION2:
+    case TE_EXPLOSION2_NL:
         ex = CL_PlainExplosion(false);
 		if (!cl_explosion_sprites->integer)
 		{
             ex->frames = 19;
             ex->baseframe = 30;
 		}
+        if (te.type == TE_EXPLOSION2_NL)
+            ex->light = 0;
         CL_ExplosionParticles(te.pos1);
         S_StartSound(te.pos1, 0, 0, cl_sfx_grenexp, 1, ATTN_NORM, 0);
         break;
@@ -1243,8 +1498,11 @@ void CL_ParseTEnt(void)
         break;
 
     case TE_EXPLOSION1:
+    case TE_EXPLOSION1_NL:
     case TE_PLASMA_EXPLOSION:
-        CL_PlainExplosion(false);
+        ex = CL_PlainExplosion(false);
+        if (te.type == TE_EXPLOSION1_NL)
+            ex->light = 0;
         CL_ExplosionParticles(te.pos1);
         S_StartSound(te.pos1, 0, 0, cl_sfx_rockexp, 1, ATTN_NORM, 0);
         break;
@@ -1260,17 +1518,7 @@ void CL_ParseTEnt(void)
         break;
 
     case TE_BFG_EXPLOSION:
-        ex = CL_AllocExplosion();
-        VectorCopy(te.pos1, ex->ent.origin);
-        ex->type = ex_poly;
-        ex->ent.flags = RF_FULLBRIGHT;
-        ex->start = cl.servertime - CL_FRAMETIME;
-        ex->light = 350;
-        VectorSet(ex->lightcolor, 0.0f, 1.0f, 0.0f);
-        ex->ent.model = cl_mod_bfg_explo;
-        ex->ent.flags |= RF_TRANSLUCENT;
-        ex->ent.alpha = 0.80;
-        ex->frames = 4;
+        CL_BFGExplosion(te.pos1);
         break;
 
     case TE_BFG_BIGEXPLOSION:
@@ -1279,6 +1527,11 @@ void CL_ParseTEnt(void)
 
     case TE_BFG_LASER:
         CL_ParseLaser(0xd0d1d2d3);
+        break;
+
+    case TE_BFG_ZAP:
+        CL_ParseLaser(0xd0d1d2d3);
+        CL_BFGExplosion(te.pos2);
         break;
 
     case TE_BUBBLETRAIL:
@@ -1413,6 +1666,37 @@ void CL_ParseTEnt(void)
 
     case TE_WIDOWSPLASH:
         CL_WidowSplash();
+        break;
+
+    case TE_BERSERK_SLAM:
+        CL_BerserkSlamParticles(te.pos1, te.dir);
+
+        ex = CL_AllocExplosion();
+        VectorCopy(te.pos1, ex->ent.origin);
+        dirtoangles(ex->ent.angles);
+        ex->type = ex_misc;
+        ex->ent.model = cl_mod_explode;
+        ex->ent.flags = RF_FULLBRIGHT | RF_TRANSLUCENT;
+        ex->ent.scale = 3;
+        ex->ent.skinnum = 2;
+        ex->start = cl.servertime - CL_FRAMETIME;
+        ex->light = 550;
+        VectorSet(ex->lightcolor, 0.19f, 0.41f, 0.75f);
+        ex->frames = 4;
+        break;
+
+    case TE_GRAPPLE_CABLE_2:
+        VectorSet(te.offset, 9, 12, -3);
+        CL_ParsePlayerBeam(cl_mod_grapple_cable);
+        break;
+
+    case TE_LIGHTNING_BEAM:
+        VectorSet(te.offset, 0, 12, -12);
+        CL_ParsePlayerBeam(cl_mod_lightning);
+        break;
+
+    case TE_POWER_SPLASH:
+        CL_PowerSplash();
         break;
 
     default:
